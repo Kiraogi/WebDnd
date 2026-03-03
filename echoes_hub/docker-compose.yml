@@ -2,7 +2,7 @@
 version: '3.8'
 
 services:
-  # 🔹 PostgreSQL - База данных
+  # ==================== БАЗА ДАННЫХ ====================
   db:
     image: postgres:15-alpine
     container_name: echoes_db
@@ -11,7 +11,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - pg_/var/lib/postgresql/data
     ports:
       - "5432:5432"
     networks:
@@ -22,13 +22,13 @@ services:
       timeout: 5s
       retries: 5
 
-  # 🔴 Redis - Кэш и хранение состояний
+  # ==================== REDIS ====================
   redis:
     image: redis:7-alpine
     container_name: echoes_redis
     command: redis-server --appendonly yes
     volumes:
-      - redis_data:/data
+      - redis_/data
     ports:
       - "6379:6379"
     networks:
@@ -39,7 +39,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # 🐰 RabbitMQ - Брокер очередей для Celery
+  # ==================== RABBITMQ ====================
   rabbitmq:
     image: rabbitmq:3-management
     container_name: echoes_rabbitmq
@@ -47,10 +47,10 @@ services:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
     volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
+      - rabbitmq_/var/lib/rabbitmq
     ports:
-      - "5672:5672"   # Порт для соединений
-      - "15672:15672" # Веб-интерфейс управления
+      - "5672:5672"
+      - "15672:15672"
     networks:
       - echoes_network
     healthcheck:
@@ -59,45 +59,52 @@ services:
       timeout: 10s
       retries: 5
 
-  # 🐍 Backend - FastAPI приложение
-  backend:
+  # ==================== DJANGO (Основной сайт) ====================
+  django:
     build:
-      context: ./backend
+      context: ./backend_django
       dockerfile: Dockerfile
-    container_name: echoes_backend
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    container_name: echoes_django
+    command: >
+      sh -c "python manage.py migrate &&
+             python manage.py collectstatic --noinput &&
+             python manage.py runserver 0.0.0.0:8000"
     volumes:
-      - ./backend:/app
+      - ./backend_django:/app
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
-      - OLLAMA_HOST=${OLLAMA_HOST}
+      - DATABASE_URL=${DATABASE_URL}
+      - SECRET_KEY=${DJANGO_SECRET_KEY}
+      - DEBUG=${DJANGO_DEBUG}
+      - ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS}
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
     networks:
       - echoes_network
-    extra_hosts:
-      - "host.docker.internal:host-gateway"  # Доступ к Ollama на хосте
 
-  # 👷 Celery Worker - Фоновые задачи
-  worker:
+  # ==================== FASTAPI (Игровой сервис) ====================
+  game:
     build:
-      context: ./backend
+      context: ./backend_game
       dockerfile: Dockerfile
-    container_name: echoes_worker
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=2
+    container_name: echoes_game
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
     volumes:
-      - ./backend:/app
+      - ./backend_game:/app
+    ports:
+      - "8001:8001"
     env_file:
       - .env
     environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - RABBITMQ_URL=${RABBITMQ_URL}
       - OLLAMA_HOST=${OLLAMA_HOST}
     depends_on:
       db:
@@ -111,15 +118,40 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # 🕐 Celery Beat - Планировщик задач
+  # ==================== CELERY WORKER (Общий для обоих сервисов) ====================
+  worker:
+    build:
+      context: ./backend_game
+      dockerfile: Dockerfile
+    container_name: echoes_worker
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2
+    volumes:
+      - ./backend_game:/app
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - RABBITMQ_URL=${RABBITMQ_URL}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - echoes_network
+
+  # ==================== CELERY BEAT (Планировщик) ====================
   beat:
     build:
-      context: ./backend
+      context: ./backend_game
       dockerfile: Dockerfile
     container_name: echoes_beat
     command: celery -A app.celery_app beat --loglevel=info
     volumes:
-      - ./backend:/app
+      - ./backend_game:/app
     env_file:
       - .env
     depends_on:
@@ -130,13 +162,30 @@ services:
     networks:
       - echoes_network
 
-# 📦 Тома для постоянного хранения данных
+  # ==================== NGINX (Reverse Proxy) ====================
+  nginx:
+    image: nginx:alpine
+    container_name: echoes_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./backend_django/echoes_hub/static:/var/www/static:ro
+      - ./backend_django/echoes_hub/media:/var/www/media:ro
+    depends_on:
+      - django
+      - game
+    networks:
+      - echoes_network
+
+# ==================== ТОМА ====================
 volumes:
   pg_data:
   redis_data:
   rabbitmq_data:
 
-# 🌐 Сеть для связи сервисов
+# ==================== СЕТИ ====================
 networks:
   echoes_network:
     driver: bridge
