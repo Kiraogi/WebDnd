@@ -1,2 +1,3 @@
 Well...
 -pip =) fun
+New way 
